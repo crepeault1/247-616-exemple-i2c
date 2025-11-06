@@ -5,6 +5,7 @@
 #include <linux/i2c-dev.h> //for IOCTL defs
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <stdlib.h>
 
 // #define I2C_BUS "/dev/i2c-0" // fichier Linux representant le BUS #0
 #define I2C_BUS "/dev/i2c-1" // fichier Linux representant le BUS #1
@@ -13,33 +14,194 @@
 /*******************************************************************************************/
 #define CAPTEUR_I2C_ADDRESS 0x29 // adresse I2C du capteur de distance
 #define CAPTEUR_REGID 0x000      // adresse du registre ID du capteur de distance
-#define REGISTRE_DEPART 0x018
+#define REGISTRE_DEPART 0x018    //Registre pour le lancement d'une conversion
+#define REGISTRE_LECTURE 0x062   //Registre des données de conversion
 
 #define SINGLESHOT 0x01
 #define CONTINUOUS 0x02
 
-#define REGISTRE_LECTURE 0x062
 /*******************************************************************************************/
 /*******************************************************************************************/
 
+int setupPortI2C(void);
 int Lire_ID_Capteur(int);
 void VL6180X_Tuning(int);
+uint8_t lireCapteur(void);
+int fdPortI2C;
+
+uint8_t Registre16bitLecture[2];    
+uint8_t Registre16bitDepart[3];
 
 int main()
 {
-    int fdPortI2C; // file descriptor I2C
-    uint8_t Registre16bitLecture[2];
+    uint8_t lectureCapteur;
+
+    //Pipes
+    int pipe_P_E[2];  //Parent à Enfant
+    int pipe_E_PE[2]; //Enfant à Petit-Enfant
+    int pipe_PE_E[2]; //Petit-Enfant à Enfant
+    int pipe_E_P[2];  //Enfant à Parent
+    //
+    //  _________  [1]                [0]  _________  [1]                 [0]  _________
+    // |         | ----- pipe_P_E ------> |         | ----- pipe_E_PE ------> |         |
+    // |  Parent |                        | Enfant  |                         | Petit-  |
+    // |         | <---- pipe_E_P ------- |         | <---- pipe_PE_E ------- | enfant  |
+    // |_________| [0]                [1] |_________| [0]                 [1] |_________|
+    //
+
+    //Flags pour rendre les pipes non-bloquants
+    int flags1 = fcntl(pipe_P_E[0], F_GETFL, 0);
+    int flags2 = fcntl(pipe_E_PE[0], F_GETFL, 0);
+    int flags3 = fcntl(pipe_PE_E[0], F_GETFL, 0);
+    int flags4 = fcntl(pipe_E_P[0], F_GETFL, 0);
+
+    //Setup capteur
+    setupPortI2C();
+    printf("ID CAPTEUR = %#04x\n", Lire_ID_Capteur(fdPortI2C));
+    VL6180X_Tuning(fdPortI2C);
+
+    //Préparation des pipes pour le fork
+    if ((pipe(pipe_P_E) == -1) || 
+        (pipe(pipe_E_PE) == -1) ||
+        (pipe(pipe_PE_E) == -1) || 
+        (pipe(pipe_E_P) == -1)
+       )
+    {
+        perror("pipe");
+    }
+
+    //Changement de flags pour rendre les pipes non-blocants
+    fcntl(pipe_P_E[0], F_SETFL, flags1 | O_NONBLOCK);
+    fcntl(pipe_E_PE[0], F_SETFL, flags2 | O_NONBLOCK);
+    fcntl(pipe_PE_E[0], F_SETFL, flags3 | O_NONBLOCK);
+    fcntl(pipe_E_P[0], F_SETFL, flags4 | O_NONBLOCK);
+
+    //Debut du fork
+    pid_t pid = fork();
+    if(pid < 0)
+    {
+        printf("Fork failed.\n");
+    }
+    else if (pid == 0)
+    {
+        pid_t pid2 = fork();
+        if (pid2 < 0)
+        {
+            printf("Grandchild fork failed.\n");
+        }
+        else if (pid2 == 0)
+        {
+            //************************* PETIT-ENFANT **************************
+            char messageEnfant;
+            uint8_t distanceCapteur;
+            int Mode = 0;
+            //Fermeture des copies de pipes inutiles reçues dans le fork()
+            close(pipe_P_E[0]);
+            close(pipe_P_E[1]);
+            close(pipe_E_P[0]);
+            close(pipe_E_P[1]);
+                 
+            while(1)
+            {
+                if (read(pipe_E_PE[0], &messageEnfant, 1) > 0)
+                {
+                    switch (messageEnfant)
+                    {
+                    case 'm':
+                        Mode = 1;
+                        //printf("TestDebug\n");
+                        break;
+                    case 's':
+                        Mode = 0;
+                        
+                        break;
+                    case 'q':
+                        printf("Fin du processus Petit-enfant.\n");
+                        sleep(1);
+                        fflush(stdout);
+                        write(pipe_E_PE[1], "q", 1);
+                        _exit(0);
+                        break;
+                    default:
+                        continue;
+                    }
+                    if (Mode == 1)
+                    {
+                        distanceCapteur = lireCapteur();
+                        write(pipe_PE_E[1], &distanceCapteur, 1);
+                    }
+                }
+            }
+        }
+        else
+        {
+            //**************************** ENFANT *****************************
+            uint8_t messageDuParent;
+            uint8_t messageDuPetitEnfant;
+            while(1)
+            {
+                // Lecture des messages du parent et envoi au petit-enfant
+                read(pipe_P_E[0], &messageDuParent, 1);
+                write(pipe_E_PE[1], &messageDuParent, 1);
+                if (messageDuParent == 'm')
+                {
+                    // Lecture des messages du petit enfant
+                    if(read(pipe_PE_E[0], &messageDuPetitEnfant, 1) > 0)
+                    {
+                        if (messageDuPetitEnfant == 'q')
+                        {
+                            printf("Fin du processus Enfant.\n");
+                            write(pipe_E_P[1], "q", 1);
+                            wait(NULL);
+                            _exit(0);
+                        }
+                        else
+                        {
+                            printf("Lecture du capteur: %03d\n", messageDuPetitEnfant);
+                            usleep(100000);
+                        }
+                    }
+                    else
+                    {
+                        usleep(1000);
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        //****************************** PARENT *******************************
+        char inputTerminal;
+        //Fermeture des pipes inutiles reçues dans le fork() (enfant-petit enfant)
+        close(pipe_E_PE[0]);
+        close(pipe_E_PE[1]);
+        close(pipe_PE_E[0]);
+        close(pipe_PE_E[1]);
+
+        while(inputTerminal != 'q')
+        {
+            inputTerminal = getchar();
+            if((inputTerminal == 'm') || (inputTerminal == 's'))
+            {
+                write(pipe_P_E[1], &inputTerminal, 1);
+            }
+        }
+        wait(NULL);
+        printf("Fin du processus Parent. Programme terminé.\n");
+    }
+    close(fdPortI2C);
+    return 0;
+}
+
+int setupPortI2C(void)
+{
     Registre16bitLecture[0] = (uint8_t)(REGISTRE_LECTURE >> 8);
     Registre16bitLecture[1] = (uint8_t)REGISTRE_LECTURE;
-
-    uint8_t Registre16bitDepart[3];
+    
     Registre16bitDepart[0] = (uint8_t)(REGISTRE_DEPART >> 8);
     Registre16bitDepart[1] = (uint8_t)REGISTRE_DEPART;
-    Registre16bitDepart[2] = (uint8_t)0x01;
-
-    uint8_t RegistreLectureEcriture[2] = {SINGLESHOT, CONTINUOUS};
-    uint8_t lectureCapteur;
-    uint8_t SingleShot = 0x01;
+    Registre16bitDepart[2] = (uint8_t)SINGLESHOT;
 
     fdPortI2C = open(I2C_BUS, O_RDWR); // ouverture du 'fichier', création d'un 'file descriptor' vers le port I2C
     if (fdPortI2C == -1)
@@ -55,42 +217,6 @@ int main()
         close(fdPortI2C);
         return 1;
     }
-
-    //Lecture du ID du capteur (normalement 0xB4)
-    printf("ID CAPTEUR = %#04x\n", Lire_ID_Capteur(fdPortI2C));
-
-    //Envoi des informations de preparation a l'utilisation du VL6180X
-    VL6180X_Tuning(fdPortI2C);
-
-    while(1)
-    {
-        // trigger measurement
-        write(fdPortI2C, Registre16bitDepart, 3);
-
-        usleep(500);
-
-        // read range result
-        write(fdPortI2C, Registre16bitLecture, 2);
-        read(fdPortI2C, &lectureCapteur, 1);
-
-        // clear interrupt
-        uint8_t clrAddr[2] = {0x00, 0x15};
-        uint8_t clr = 0x07;
-        write(fdPortI2C, clrAddr, 2);
-        write(fdPortI2C, &clr, 1);
-
-        //Ecriture au registre de depart (0x018)
-        //write(fdPortI2C, Registre16bitDepart, 2);
-        //write(fdPortI2C, &SingleShot, 1);
-
-        //Lecture au registre de lecture (0x062)
-        //write(fdPortI2C, Registre16bitLecture, 2);
-        //read(fdPortI2C, &lectureCapteur, 1);
-        printf("Lecture du capteur: %02d\n", lectureCapteur);
-        sleep(1);
-    }
-    close(fdPortI2C);
-    return 0;
 }
 
 int Lire_ID_Capteur(int fdPortI2C)
@@ -158,6 +284,7 @@ void VL6180X_Tuning(int fdI2C)
                                     {0x003E, 0x31},
                                     {0x0014, 0x24},
                                     {0x0016, 0x00}};
+
     //Clear "Fresh Out of Reset" flag
     uint8_t addr[2] = {0x00, 0x16};
     uint8_t clear = 0x00;
@@ -178,6 +305,22 @@ void VL6180X_Tuning(int fdI2C)
             perror("Tuning write operation");
         }
     }
-    printf("Tuning success!\n");
+    printf("Tuning success. Press 'm' to measure and 's' to stop.\n");
     sleep(1);
+}
+
+uint8_t lireCapteur(void)
+{
+    uint8_t distanceCapteur;
+    // Lance une conversion
+    write(fdPortI2C, Registre16bitDepart, 3);
+
+    // Sleep pendant la conversion
+    usleep(500);
+
+    // Lecture du registre de data
+    write(fdPortI2C, Registre16bitLecture, 2);
+    read(fdPortI2C, &distanceCapteur, 1);
+
+    return distanceCapteur;
 }
